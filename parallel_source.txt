@@ -1,0 +1,157 @@
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+penguins = pd.read_csv("penguins.csv")
+
+tipo de datos/columnas:
+penguins[e].dtype for e in penguins.columns
+
+species - cualitativo
+island - cualitativo
+bill_length_mm - cuantitativo contínuo
+bill_depth_mm - cuantitativo contínuo
+flipper_length_mm - cuantitativo contínuo
+body_mass_g - cuantitativo contínuo
+sex - cualitativo
+
+Desbalanceo de clases
+
+Ahora sería de interés que mirásemos hacia los datos cualitativos, para ver la frecuencia de cada posible valor, por si hubiese desbalanceo de clases
+
+[penguins[e].value_counts() for e in penguins.columns if not is_numeric_dtype(penguins[e].dtype)]
+
+Como se puede observar, los sexos están bastante bien distribuidos (porcentajes muy cercanos al 50%), la especie está algo desbalanceada pero es bastante potable pero la isla está desmadrada, con un valor ocupando poco más del 10% del total
+
+Antes de ver qué hacer con ésta variable, habremos de entrar más a fondo, porque hay un fenómeno curioso
+
+[f"{penguins[penguins.island == e].species.value_counts().index} on island {e}" for e in penguins.island.value_counts().index]
+
+Como podemos ver, solo una especie se presenta en las tres islas, lo que para nuestro modelo se podría traducir en que ciertas especies pertenecen solo a una isla o dos (cosa que no tiene por qué reflejarse en la realidad puesto que ninguna de las tres especies mantienen un territorio fijo, especialmente la Gentoo)
+Por ello, la columna isla es prescindible
+
+penguins.drop(axis=1, columns="island", inplace=True)
+
+Exploración de variables
+
+Ahora entremos en las variables en sí. Antes de nada, procede ver si alguna de éstas está relacionada de más con las demás
+
+sns.heatmap(penguins.corr(), annot=True, cbar=True, cmap="RdYlGn")
+
+Como se puede ver, la longitud de las aletas está muy correlacionada con la masa y presenta peores correlaciones que ésta, por lo que prescindiremos de la columna
+
+penguins.drop(axis=1, columns="flipper_length_mm", inplace=True)
+
+Por descartar algunas cosas, la variable sexo se queda, porque como podemos ver en los distintos pairplots por especies (primero Adelie, luego Gentoo y luego Chinstrap)
+
+plt.show([sns.pairplot(penguins[penguins.species == e], hue='sex') for e in penguins.species.value_counts().index])
+
+La separación entre machos y hembras es bastante clara y no es excesivamente limitada (es decir, los valores están suficientemente dispersos del los que posee el individuo medio de la especie)
+
+Preprocesamiento
+
+[f"Percent of not nulls in column {e} is {len([i for i in penguins[e].notnull() if i])/len(penguins)}" for e in penguins.columns]
+
+En todas ellas el porcentaje es muy bajo, un 3.2% en la que más, por lo que podemos eliminar los registros con algún valor nulo
+
+penguins.dropna(inplace=True) //Drops all rows with a null, and applies to the penguins DataFrame
+
+Ahora entremos en las variables en sí. Antes de nada, procede ver si alguna de éstas está relacionada de más con las demás
+
+Para reflejar las variaciones entre la desviación estándar y las medias. Nótese que lo estamos tratando como absoluto, luego los grados de libertad (ddof) son 0:
+
+from pandas.api.types import is_numeric_dtype
+
+[f"Column {e} variation is {penguins[e].std(ddof=0)/penguins[e].mean()}" for e in penguins.columns if is_numeric_dtype(penguins[e].dtype)]
+
+Todas las columnas salvo la de la masa coporal presentan variaciones bastantes normales. Por ello, habremos de ver qué pasa con dicha columna
+
+mass = penguins["body_mass_g"]
+
+Para ver todos los zscores grandes (es decir, que se aproximan al máximo de la varianza)
+
+from scipy.stats import zscore
+
+for e in np.arange(0., 3., 0.25):
+    print(f"Number of elements over {e} times the deviation is {len([i for i in abs(zscore(mass, ddof=0)) if i > e])}")
+
+Si afinamos un poco y usamos 0.125 en lugar de 0.25, tendremos mayor precisión:
+
+for e in np.arange(0., 3., 0.125):
+    print(f"Number of elements over {e} times the deviation is {len([i for i in abs(zscore(mass, ddof=0)) if i > e])}")
+
+Como se puede ver, a pesar de sus valores extremadamente altos, la distribución de los zscores no presenta disrupciones y se sitúa correctamente entre los zscores 1 y 3 (un zscore de 3 o más indica un outlier, que no posee nuestro dataset)
+
+from sklearn import preprocessing as prepro
+
+normalizer = prepro.Normalizer(norm='l1')
+norm_mass = normalizer.fit_transform(mass.values.reshape(1, -1))[0]
+
+penguins["body_mass_g"] = norm_mass
+
+Para acabar el preprocesamiento, convertiremos los datos cualitativos en etiquetas
+
+species = penguins.species
+sex = penguins.sex
+le = prepro.LabelEncoder
+
+species_labeled = le.fit_transform(le, y=species)
+penguins.species = species_labeled
+
+sex_labeled = le.fit_transform(le, y=sex)
+penguins.sex = sex_labeled
+
+Ahora toca entrenar los modelos
+
+from sklearn.metrics import accuracy_score, plot_confusion_matrix, classification_report, confusion_matrix
+
+Definamos una pequeña función para poder comparar los resultados de forma cómoda
+
+def show_metrics(clf, y_test, y_pred):
+    print(f'Accuracy score: {int(accuracy_score(y_test, y_pred)*100)}%\n')
+    print(classification_report(y_test, y_pred))
+    
+    disp = plot_confusion_matrix(clf, X_test, y_test)
+    disp.figure_.suptitle("Confusion Matrix")
+    plt.show()
+
+Primero, vamos a crear la base de los sets de entrenamiento y prueba
+
+from sklearn.model_selection import train_test_split
+
+X = penguins.drop("species", axis=1)
+Y = penguins.species.values
+
+Y ahora los sets en si. Probaremos una división entre mitades
+
+X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.5, random_state=73)
+
+Ahora, lo nuestro es un problema de clasificación.
+Siguiendo el mapa que amablemente nos proporciona la gente de scikit-learn: https://scikit-learn.org/stable/tutorial/machine_learning_map/index.html
+elegiremos como primer algoritmo el linear support vector classification, puesto que obviamente tenemos más de cincuenta muestras,
+queremos obtener una categoría, tenemos datos preetiquetados y más de cien muestras
+
+from sklearn.svm import SVC, LinearSVC
+
+linear_svc = SVC(gamma='auto')
+linear_svc.fit(X_train, Y_train)
+
+y_pred = linear_svc.predict(X_test)
+show_metrics(linear_svc, Y_test, Y_pred)
+
+Como podemos ver tenemos una buena precisión con una matriz de confusión aceptable
+
+Para hacer la cross-validation:
+
+from sklearn.model_selection import cross_val_score
+
+[print(i) for i in [cross_val_score(SVC(kernel=e, C=1, random_state=73), X, Y, cv=5) for e in ['linear', 'rbf', 'poly']]]
+
+
+Los cross scores están muy bien en el lineal, bastante bien en el polinomial y bien a secas en el rfb, por lo que nuestro modelo está bien diseñado, aunque queda abierto a mejoras
+
+
+
+
+
